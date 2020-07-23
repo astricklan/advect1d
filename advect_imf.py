@@ -1,20 +1,24 @@
 from matplotlib import pyplot as plt
 from spacepy import datamodel as dm
 from cdaweb import get_cdf
-
+from missing import fill_gaps
 from cache_decorator import cache_result
 
 from datetime import datetime, timedelta
 import numpy as np
+from spacepy import pybats
+
+import os
 
 @cache_result(clear=False)
-def load_acedata(tstart,tend, proxy=None):
+def load_acedata(tstart,tend, noise = True, proxy=None):
     """
     Fetch ACE data from CDAWeb
 
     tstart: Desired start time
     tend: Desired end time
-
+    noise: Adds noise to fill_gaps function
+    
     Returns: A dictionary of tuples, each containing an array of times and an array of ACE observations for a particular variable
     """
 
@@ -33,7 +37,7 @@ def load_acedata(tstart,tend, proxy=None):
         for dataset,local_name,cdaweb_name in [(mag_data,'b','BGSM'),
                                  (swepam_data,'u','V_GSM'),
                                  (swepam_data,'','SC_pos_GSM')]:
-            t,values=dataset['Epoch'],dataset[cdaweb_name][:,i]
+            t,values=dataset['Epoch'],fill_gaps(dataset[cdaweb_name][:,i], noise = noise)
             
             # Grab the appropriate component from
             # VALIDMIN and VALIDMAX attributes
@@ -56,12 +60,13 @@ def load_acedata(tstart,tend, proxy=None):
         
 
 @cache_result(clear=False)
-def load_dscovr(tstart,tend, proxy=None):
+def load_dscovr(tstart,tend, noise = True, proxy=None):
     """
     Fetch DSCOVR data from CDAWeb
 
     tstart: Desired start time
     tend: Desired end time
+    noise: Adds noise to fill_gaps function
 
     Returns: A dictionary of tuples, each containing an array of times and an array of DSCOVR observations for a particular variable
     """
@@ -83,7 +88,7 @@ def load_dscovr(tstart,tend, proxy=None):
                 (mag_data,'b','B1GSE','Epoch1'),
                 (plasma_data,'u','V_GSE','Epoch'),
                 (orbit_data,'','GSE_POS','Epoch')]:
-            t,values=dataset[cdaweb_time_var],dataset[cdaweb_name][:,i]
+            t,values=dataset[cdaweb_time_var],fill_gaps(dataset[cdaweb_name][:,i], noise = noise)
 
             for attr in ('VALIDMIN','VALIDMAX'):
 
@@ -218,10 +223,66 @@ def iterate(state,t,outdata,sw_data,nuMax=0.5,output_x=0,limiter='Minmod'):
 
     return dt
 
+def parse_args(starttime=None,endtime=None):
+    from argparse import ArgumentParser
+
+    parser=ArgumentParser()
+
+    starttime=starttime or datetime(2017,9,6,20)
+    endtime=endtime or datetime(2017,9,7,5)
+
+    parser.add_argument(
+        '--start-time',type=lambda s: datetime.strptime(s,'%Y-%m-%dT%H:%M:%S'),
+        default=starttime,
+        help='Start time of solar wind observations, universal time in YYYY-MM-DDTHH:MM:SS')
+    parser.add_argument(
+        '--end-time',type=lambda s: datetime.strptime(s,'%Y-%m-%dT%H:%M:%S'),
+        default=endtime,
+        help='Start time of solar wind observations, universal time in YYYY-MM-DDTHH:MM:SS')
+    parser.add_argument('--source',default='DSCOVR',
+                        help='Solar wind data source (''ACE'' or ''DSCOVR'')')
+    parser.add_argument('--proxy',help='Proxy server URL')
+    parser.add_argument('--disable-noise',action='store_true',
+                        help='By default, data gaps in the upstream solar wind data will be filled with a noisy interpolation algorithm developed by M. Engel and S. Morley. With this argument, the noisy interpolation is disabled and a linear interpolation used instead')
+
+    args=parser.parse_args()
+
+    proxy=args.proxy or os.environ.get('http_proxy')
+
+    if proxy:
+        # Convert proxy URL into a tuple to be passed to
+        # urllib2.Request.set_proxy
+        import re
+        m=re.match('((?P<scheme>[a-z]+)://)?(?P<host>\w+)/?',proxy)
+        scheme=m.group('scheme') or 'http'
+        host=m.group('host')
+        args.proxy=(host,scheme)
+
+    return args
+
+def fetch_solarwind(starttime,endtime,source='DSCOVR',proxy=None):
+    if source=='DSCOVR':
+        sw_data=load_dscovr(starttime,endtime, proxy=proxy)
+    elif source=='ACE':
+        sw_data=load_acedata(starttime,endtime, proxy=proxy)
+    else:
+        raise ValueError('Invalid source ''{}'''.format(source))
+
+    return sw_data
+
 if __name__=='__main__':
-    proxy = None #('proxy.example.edu:1406', 'https')
+
+    args=parse_args()
+
+    noise=not args.disable_noise
+
+    starttime=args.start_time
+    endtime=args.end_time
+    source=args.source
+    proxy=args.proxy
+
     # Fetch solar wind data
-    sw_data=load_dscovr(datetime(2017,9,6,20),datetime(2017,9,7,5), proxy=proxy)
+    sw_data=fetch_solarwind(starttime,endtime,source,proxy)
 
     output_x=0
 
@@ -239,8 +300,28 @@ if __name__=='__main__':
         t+=dt
         i+=1
 
-    # Write output to disk
-    import spacepy.datamodel as dm
+    # Convert timesteps to datetimes
+    outdata['time'] = [starttime + timedelta(seconds = n)
+                        for n in outdata['time']] 
+    
+    # Set up pram and temp keys
+    outdata['pram_1'] = np.multiply(outdata['ux'], outdata['ux'])
+    outdata['pram_2'] = np.multiply(outdata['pram_1'], outdata['rho'])
+    outdata['pram'] = 1.67621e-6*outdata['pram_2']
+    
+    outdata['temp'] = outdata['T']
+    
+    # Set up dictionary
+    imf = pybats.ImfInput(load=False)
+    for key in imf.keys():
+        imf[key] = dm.dmarray(outdata[key])   
+        
+
+    # Write the IMF data to .dat file
+    imf.write('IMF_data.dat')
+    
+    
+    # Write the IMF data to .h5 file
     outhdf=dm.SpaceData()
     for key in outdata.keys():
         outhdf[key]=dm.dmarray(outdata[key])
